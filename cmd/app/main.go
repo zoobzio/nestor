@@ -5,13 +5,22 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 	"github.com/zoobzio/aperture"
+	"github.com/zoobzio/astql/postgres"
 	"github.com/zoobzio/capitan"
 	"github.com/zoobzio/sum"
-	"github.com/zoobzio/sumatra/events"
-	intotel "github.com/zoobzio/sumatra/internal/otel"
+	"github.com/zoobzio/nestor/api/contracts"
+	"github.com/zoobzio/nestor/api/handlers"
+	"github.com/zoobzio/nestor/api/ingest"
+	"github.com/zoobzio/nestor/config"
+	"github.com/zoobzio/nestor/events"
+	"github.com/zoobzio/nestor/external/chunker"
+	"github.com/zoobzio/nestor/external/embedding"
+	intotel "github.com/zoobzio/nestor/internal/otel"
+	"github.com/zoobzio/nestor/stores"
 )
 
 func main() {
@@ -32,60 +41,59 @@ func run() error {
 	// 1. Load Configuration
 	// =========================================================================
 
-	// Load all configs via sum.Config[T]().
-	// if err := sum.Config[config.App](ctx, k, nil); err != nil {
-	// 	return fmt.Errorf("failed to load app config: %w", err)
-	// }
-	// if err := sum.Config[config.Database](ctx, k, nil); err != nil {
-	// 	return fmt.Errorf("failed to load database config: %w", err)
-	// }
-	// if err := sum.Config[config.Observability](ctx, k, nil); err != nil {
-	// 	return fmt.Errorf("failed to load observability config: %w", err)
-	// }
+	if err := sum.Config[config.App](ctx, k, nil); err != nil {
+		return fmt.Errorf("failed to load app config: %w", err)
+	}
+	if err := sum.Config[config.Database](ctx, k, nil); err != nil {
+		return fmt.Errorf("failed to load database config: %w", err)
+	}
+	if err := sum.Config[config.Embedding](ctx, k, nil); err != nil {
+		return fmt.Errorf("failed to load embedding config: %w", err)
+	}
 
 	// =========================================================================
 	// 2. Connect to Infrastructure
 	// =========================================================================
 
-	// Database
-	// dbCfg := sum.MustUse[config.Database](ctx)
-	// db, err := sqlx.Connect("postgres", dbCfg.DSN())
-	// if err != nil {
-	// 	return fmt.Errorf("failed to connect to database: %w", err)
-	// }
-	// defer func() { _ = db.Close() }()
-	// log.Println("database connected")
-	// capitan.Emit(ctx, events.StartupDatabaseConnected)
+	dbCfg := sum.MustUse[config.Database](ctx)
+	db, err := sqlx.Connect("postgres", dbCfg.DSN)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	log.Println("database connected")
+	capitan.Emit(ctx, events.StartupDatabaseConnected)
 
-	// Storage (MinIO)
-	// storageCfg := sum.MustUse[config.Storage](ctx)
-	// minioClient, err := minio.New(storageCfg.Endpoint, &minio.Options{...})
-	// bucketProvider := grubminio.New(minioClient, storageCfg.Bucket)
-	// log.Println("storage connected")
-	// capitan.Emit(ctx, events.StartupStorageConnected)
+	renderer := postgres.New()
 
 	// =========================================================================
 	// 3. Create and Register Stores
 	// =========================================================================
 
-	// Import: "github.com/zoobzio/sumatra/api/stores"
-	// Import: "github.com/zoobzio/sumatra/api/contracts"
-	//
-	// allStores, err := stores.New(db, renderer, bucketProvider)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to create stores: %w", err)
-	// }
-	// sum.Register[contracts.YourContract](k, allStores.YourStore)
+	allStores, err := stores.New(db, renderer)
+	if err != nil {
+		return fmt.Errorf("failed to create stores: %w", err)
+	}
+
+	sum.Register[contracts.Agents](k, allStores.Agents)
+	sum.Register[contracts.Memories](k, allStores.Memories)
+	sum.Register[contracts.Chunks](k, allStores.Chunks)
+	sum.Register[contracts.IngestJobs](k, allStores.IngestJobs)
+	sum.Register[contracts.FilterGroups](k, allStores.FilterGroups)
 
 	// =========================================================================
-	// 4. Register Boundaries
+	// 4. Register External Clients
 	// =========================================================================
 
-	// Model boundaries
-	// sum.NewBoundary[models.YourModel](k)
+	chunkerClient := chunker.New()
+	sum.Register[contracts.Chunker](k, chunkerClient)
 
-	// Wire boundaries
-	// wire.RegisterBoundaries(k)
+	embedCfg := sum.MustUse[config.Embedding](ctx)
+	embedClient, err := embedding.NewClient(embedCfg.Provider, embedCfg.Model, embedCfg.APIKey, embedCfg.Dimensions)
+	if err != nil {
+		return fmt.Errorf("failed to create embedding client: %w", err)
+	}
+	sum.Register[contracts.Embedder](k, embedClient)
 
 	// =========================================================================
 	// 5. Freeze Registry
@@ -98,14 +106,8 @@ func run() error {
 	// 6. Initialize Observability (OTEL + Aperture)
 	// =========================================================================
 
-	otelEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if otelEndpoint == "" {
-		otelEndpoint = "localhost:4318"
-	}
-	serviceName := os.Getenv("OTEL_SERVICE_NAME")
-	if serviceName == "" {
-		serviceName = "sumatra"
-	}
+	otelEndpoint := "localhost:4318"
+	serviceName := "nestor"
 
 	otelProviders, err := intotel.New(ctx, intotel.Config{
 		Endpoint:    otelEndpoint,
@@ -118,7 +120,6 @@ func run() error {
 	log.Println("observability initialized")
 	capitan.Emit(ctx, events.StartupOTELReady)
 
-	// Initialize aperture to bridge capitan events → OTEL.
 	ap, err := aperture.New(
 		capitan.Default(),
 		otelProviders.Log,
@@ -131,29 +132,22 @@ func run() error {
 	defer ap.Close()
 	capitan.Emit(ctx, events.StartupApertureReady)
 
-	// Optional: Apply aperture schema for metrics/traces configuration.
-	// schema, err := aperture.LoadSchemaFromYAML(schemaBytes)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to load aperture schema: %w", err)
-	// }
-	// if err := ap.Apply(schema); err != nil {
-	// 	return fmt.Errorf("failed to apply aperture schema: %w", err)
-	// }
-
 	// =========================================================================
-	// 7. Register Handlers and Run
+	// 7. Start Pipeline Worker
 	// =========================================================================
 
-	// Import: "github.com/zoobzio/sumatra/api/handlers"
-	// svc.Handle(handlers.All()...)
+	worker := ingest.NewWorker()
+	worker.Start(ctx)
+	defer func() { _ = worker.Stop() }()
 
-	// appCfg := sum.MustUse[config.App](ctx)
-	// capitan.Emit(ctx, events.StartupServerListening, events.StartupPortKey.Field(appCfg.Port))
-	// log.Printf("starting server on port %d...", appCfg.Port)
-	// return svc.Run("", appCfg.Port)
+	// =========================================================================
+	// 8. Register Handlers and Run
+	// =========================================================================
 
-	_ = svc // Remove when using svc.Handle() above.
-	_ = ap  // Remove when using ap.Apply() above.
+	svc.Handle(handlers.All()...)
 
-	return fmt.Errorf("not implemented: add your initialization logic")
+	appCfg := sum.MustUse[config.App](ctx)
+	capitan.Emit(ctx, events.StartupServerListening, events.StartupPortKey.Field(appCfg.Port))
+	log.Printf("starting server on port %d...", appCfg.Port)
+	return svc.Run("", appCfg.Port)
 }
